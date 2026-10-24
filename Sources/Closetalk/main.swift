@@ -28,6 +28,27 @@ if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--transcribe" 
     exit(0)
 }
 
+// Debug path: `Closetalk --island-preview` shows the recording island with made-up sound for 3 s, then
+// transcribing for 2 s, then exits. For checking how it looks without dictating into another app.
+if CommandLine.arguments.count == 2, CommandLine.arguments[1] == "--island-preview" {
+    MainActor.assumeIsolated {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        let island = RecordingIsland()
+        island.showRecording()
+        var tick = 0.0
+        Timer.scheduledTimer(withTimeInterval: 0.06, repeats: true) { _ in
+            tick += 0.35
+            let rms = Float(0.05 + 0.05 * sin(tick) + Double.random(in: 0...0.05))
+            MainActor.assumeIsolated { island.model.levels.append(rms: rms) }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { island.showTranscribing() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { island.hide() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.5) { exit(0) }
+        app.run()
+    }
+}
+
 MainActor.assumeIsolated {
     let app = NSApplication.shared
     let delegate = AppDelegate()

@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 
 /// Captures a microphone as 16 kHz mono Float samples, the format Whisper expects.
@@ -17,10 +18,13 @@ final class Recorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private let lock = NSLock()
     private var samples: [Float] = []
     private var onFirstAudio: (() -> Void)?
+    private var onLevel: ((Float) -> Void)?
 
     /// `device` nil means the system default input. `onFirstAudio` runs on the main thread once
     /// real audio arrives, which for Bluetooth headsets can be most of a second after start().
-    func start(device: AVCaptureDevice?, onFirstAudio: @escaping () -> Void) throws {
+    /// `onLevel` gets each chunk's loudness (RMS) on the main thread, for the recording island.
+    func start(device: AVCaptureDevice?, onFirstAudio: @escaping () -> Void,
+               onLevel: @escaping (Float) -> Void) throws {
         guard let device = device ?? AVCaptureDevice.default(for: .audio) else {
             throw NSError(domain: "Recorder", code: 1, userInfo: [NSLocalizedDescriptionKey: "No microphone available"])
         }
@@ -45,6 +49,7 @@ final class Recorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         lock.withLock {
             samples.removeAll()
             self.onFirstAudio = onFirstAudio
+            self.onLevel = onLevel
         }
         sessionQueue.async {
             self.session = session
@@ -60,6 +65,7 @@ final class Recorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         bufferQueue.sync {}  // Let any buffer already in flight land.
         return lock.withLock {
             onFirstAudio = nil
+            onLevel = nil
             // Hand the audio over and drop our copy, so it isn't kept in memory between dictations.
             defer { samples = [] }
             return samples
@@ -77,12 +83,17 @@ final class Recorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         guard status == noErr else { return }
 
         // Some devices deliver pure zeros while they spin up; wait for a non-zero sample.
-        let callback: (() -> Void)? = lock.withLock {
+        let (callback, levelHandler): ((() -> Void)?, ((Float) -> Void)?) = lock.withLock {
             samples.append(contentsOf: chunk)
-            guard let pending = onFirstAudio, chunk.contains(where: { $0 != 0 }) else { return nil }
+            guard let pending = onFirstAudio, chunk.contains(where: { $0 != 0 }) else { return (nil, onLevel) }
             onFirstAudio = nil
-            return pending
+            return (pending, onLevel)
         }
         if let callback { DispatchQueue.main.async(execute: callback) }
+        if let levelHandler {
+            var rms: Float = 0
+            vDSP_rmsqv(chunk, 1, &rms, vDSP_Length(count))
+            DispatchQueue.main.async { levelHandler(rms) }
+        }
     }
 }

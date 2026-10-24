@@ -15,10 +15,13 @@ final class DictationController {
     private static let stopSound = NSSound(named: "Pop")
     /// Safety net if a key release never reaches us (e.g. the screen locked mid-hold).
     private static let maxRecordingLength: TimeInterval = 5 * 60
+    /// Just past HotkeyStateMachine's quick-tap window (0.2 s), so a tap never shows the island.
+    private static let islandDelay: TimeInterval = 0.25
 
     private let menuBar: MenuBarController
     private let setup: SetupModel
     private let recorder = Recorder()
+    private let island = RecordingIsland()
     private let transcriber = Transcriber()
     private var machine = HotkeyStateMachine()
     private var spacing = SpacingPolicy()
@@ -172,13 +175,20 @@ final class DictationController {
             let id = recordingID
             let pressedAt = ProcessInfo.processInfo.systemUptime
             do {
-                try recorder.start(device: MicrophoneSettings.selectedDevice()) { [weak self] in
+                try recorder.start(device: MicrophoneSettings.selectedDevice(), onFirstAudio: { [weak self] in
                     guard let self, self.isRecording, self.recordingID == id else { return }
                     let delay = Int((ProcessInfo.processInfo.systemUptime - pressedAt) * 1000)
                     Self.log.notice("mic live \(delay) ms after key down")
                     Self.play(Self.startSound)
-                }
+                }, onLevel: { [weak self] rms in
+                    self?.island.model.levels.append(rms: rms)
+                })
                 isRecording = true
+                // Shown once the key has been held past a quick tap, so taps and shortcuts don't flash it.
+                DispatchQueue.main.asyncAfter(deadline: .now() + Self.islandDelay) { [weak self] in
+                    guard let self, self.isRecording, self.recordingID == id else { return }
+                    self.island.showRecording()
+                }
                 let timeout = DispatchWorkItem { [weak self] in
                     guard let self, self.isRecording, self.recordingID == id else { return }
                     Self.log.notice("recording hit the length limit, cancelling")
@@ -195,6 +205,7 @@ final class DictationController {
             _ = recorder.stop()
             isRecording = false
             recordingTimeout?.cancel()
+            settleIsland()
         case .finishRecording:
             guard isRecording else { return }
             let samples = recorder.stop()
@@ -202,6 +213,7 @@ final class DictationController {
             recordingTimeout?.cancel()
             Self.play(Self.stopSound)
             if samples.count >= Self.minimumSamples { transcribe(samples) }
+            settleIsland()
         }
         refreshMenu()
     }
@@ -229,8 +241,16 @@ final class DictationController {
                 setup.dictationInserted()
                 spacing.recordInsert(at: now)
             }
+            settleIsland()
             refreshMenu()
         }
+    }
+
+    /// Between recordings the island shows a spinner until every pending transcription has landed.
+    /// While recording, the recording branch shows it once the key is held past a quick tap.
+    private func settleIsland() {
+        guard !isRecording else { return }
+        if pendingTranscriptions > 0 { island.showTranscribing() } else { island.hide() }
     }
 
     private static func play(_ sound: NSSound?) {
